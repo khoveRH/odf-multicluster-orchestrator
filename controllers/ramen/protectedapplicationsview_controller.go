@@ -13,6 +13,7 @@ import (
 	ramenv1alpha1 "github.com/ramendr/ramen/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -52,6 +53,12 @@ type ProtectedApplicationViewReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 	Logger *slog.Logger
+
+	// applicationSetSupported records whether the argoproj.io/v1alpha1 ApplicationSet
+	// CRD is registered on the cluster. It is false when OpenShift GitOps is not
+	// installed, in which case ApplicationSet-based application discovery is skipped
+	// and DRPCs fall back to Subscription- or Discovered-type detection.
+	applicationSetSupported bool
 }
 
 type ApplicationResult struct {
@@ -124,28 +131,43 @@ func (r *ProtectedApplicationViewReconciler) getPrimaryClusterFromDRPC(drpc *ram
 func (r *ProtectedApplicationViewReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	ctx := context.Background()
 
-	if err := mgr.GetCache().IndexField(ctx, &argov1alpha1.ApplicationSet{},
-		clusterDecisionResourceIndexName,
-		func(o client.Object) []string {
-			appSet, ok := o.(*argov1alpha1.ApplicationSet)
-			if !ok {
-				return nil
-			}
-			var placements []string
+	if _, err := mgr.GetRESTMapper().RESTMapping(
+		argov1alpha1.SchemeGroupVersion.WithKind(applicationSetKind).GroupKind(),
+		argov1alpha1.SchemeGroupVersion.Version,
+	); err != nil {
+		if !meta.IsNoMatchError(err) {
+			return fmt.Errorf("failed to check ApplicationSet API availability: %w", err)
+		}
 
-			for _, gen := range appSet.Spec.Generators {
-				if gen.ClusterDecisionResource != nil {
-					for key, value := range gen.ClusterDecisionResource.LabelSelector.MatchLabels {
-						if strings.Contains(key, placementLabel) {
-							placements = append(placements, value)
+		r.Logger.Warn("ApplicationSet CRD (argoproj.io/v1alpha1) not found in cluster; " +
+			"OpenShift GitOps is likely not installed. Disabling ApplicationSet-based " +
+			"application discovery; DRPCs will fall back to Subscription/Discovered detection")
+	} else {
+		r.applicationSetSupported = true
+
+		if err := mgr.GetCache().IndexField(ctx, &argov1alpha1.ApplicationSet{},
+			clusterDecisionResourceIndexName,
+			func(o client.Object) []string {
+				appSet, ok := o.(*argov1alpha1.ApplicationSet)
+				if !ok {
+					return nil
+				}
+				var placements []string
+
+				for _, gen := range appSet.Spec.Generators {
+					if gen.ClusterDecisionResource != nil {
+						for key, value := range gen.ClusterDecisionResource.LabelSelector.MatchLabels {
+							if strings.Contains(key, placementLabel) {
+								placements = append(placements, value)
+							}
 						}
 					}
 				}
-			}
 
-			return placements
-		}); err != nil {
-		return fmt.Errorf("failed to setup ApplicationSet index: %w", err)
+				return placements
+			}); err != nil {
+			return fmt.Errorf("failed to setup ApplicationSet index: %w", err)
+		}
 	}
 
 	if err := mgr.GetCache().IndexField(ctx, &ramenv1alpha1.DRPlacementControl{},
@@ -392,6 +414,10 @@ func (r *ProtectedApplicationViewReconciler) findApplicationSetByPlacement(
 	drpc *ramenv1alpha1.DRPlacementControl,
 	placement *placementv1beta1.Placement,
 ) (*argov1alpha1.ApplicationSet, error) {
+	if !r.applicationSetSupported {
+		return nil, nil
+	}
+
 	logger := r.Logger.With("Placement", placement.Name, "DRPC", drpc.Name)
 
 	appSetList := &argov1alpha1.ApplicationSetList{}
